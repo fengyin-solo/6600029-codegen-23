@@ -1,4 +1,14 @@
-import type { Waypoint, NoFlyZone, TerrainPoint, FlightPlan, DroneConfig } from '../types';
+import type {
+  Waypoint,
+  NoFlyZone,
+  TerrainPoint,
+  FlightPlan,
+  DroneConfig,
+  CoverageFootprint,
+  ReflightSegment,
+  CoverageGap,
+  CoverageResult,
+} from '../types';
 
 // ─── Haversine distance ─────────────────────────────────────────────────────
 export function haversine(lat1: number, lng1: number, lat2: number, lng2: number): number {
@@ -392,3 +402,245 @@ export const mockTerrainData: TerrainPoint[] = (() => {
   }
   return points;
 })();
+
+// ─── Shooting Coverage Check ───────────────────────────────────────────────
+// Only waypoints whose action captures imagery contribute to coverage.
+const SHOOTING_ACTIONS: ReadonlySet<Waypoint['action']> = new Set(['photo', 'video']);
+
+export function formatAreaReadable(m2: number): string {
+  if (m2 >= 1000000) return `${(m2 / 1000000).toFixed(2)} km²`;
+  if (m2 >= 1000) return `${(m2 / 1000).toFixed(1)} 千 m²`;
+  return `${m2.toFixed(0)} m²`;
+}
+
+// Equirectangular projection of a (lat,lng) to local planar meters around a ref latitude.
+function toPlanar(lat: number, lng: number, refLat: number): [number, number] {
+  const latRad = (lat * Math.PI) / 180;
+  const refLatRad = (refLat * Math.PI) / 180;
+  const x = lng * 111320 * Math.cos(refLatRad);
+  const y = lat * 110540;
+  return [x, y];
+}
+
+// Distance (meters) from point P to segment AB using planar approximation.
+function pointToSegmentDistance(
+  pLat: number, pLng: number,
+  aLat: number, aLng: number,
+  bLat: number, bLng: number
+): number {
+  const [px, py] = toPlanar(pLat, pLng, pLat);
+  const [ax, ay] = toPlanar(aLat, aLng, pLat);
+  const [bx, by] = toPlanar(bLat, bLng, pLat);
+  const dx = bx - ax;
+  const dy = by - ay;
+  const segLenSq = dx * dx + dy * dy;
+  let t = 0;
+  if (segLenSq > 0) {
+    t = ((px - ax) * dx + (py - ay) * dy) / segLenSq;
+    t = Math.max(0, Math.min(1, t));
+  }
+  const cx = ax + t * dx;
+  const cy = ay + t * dy;
+  return Math.sqrt((px - cx) ** 2 + (py - cy) ** 2);
+}
+
+function findNearestSegment(
+  waypoints: Waypoint[],
+  lat: number,
+  lng: number
+): { distance: number; segment: ReflightSegment } {
+  if (waypoints.length === 0) {
+    return {
+      distance: Infinity,
+      segment: {
+        fromIndex: -1, toIndex: -1, fromId: '', toId: '',
+        from: [lat, lng], to: [lat, lng], distance: 0,
+      },
+    };
+  }
+  if (waypoints.length === 1) {
+    const w = waypoints[0];
+    return {
+      distance: haversine(lat, lng, w.lat, w.lng),
+      segment: {
+        fromIndex: 0, toIndex: 0, fromId: w.id, toId: w.id,
+        from: [w.lat, w.lng], to: [w.lat, w.lng], distance: 0,
+      },
+    };
+  }
+
+  let best = Infinity;
+  let bestSeg: ReflightSegment | null = null;
+  for (let i = 0; i < waypoints.length - 1; i++) {
+    const a = waypoints[i];
+    const b = waypoints[i + 1];
+    const dist = pointToSegmentDistance(lat, lng, a.lat, a.lng, b.lat, b.lng);
+    if (dist < best) {
+      best = dist;
+      bestSeg = {
+        fromIndex: i,
+        toIndex: i + 1,
+        fromId: a.id,
+        toId: b.id,
+        from: [a.lat, a.lng],
+        to: [b.lat, b.lng],
+        distance: haversine(a.lat, a.lng, b.lat, b.lng),
+      };
+    }
+  }
+  return { distance: best, segment: bestSeg! };
+}
+
+export function checkCoverage(
+  waypoints: Waypoint[],
+  config: DroneConfig,
+  resolution = 32
+): CoverageResult {
+  const emptyTarget = { minLat: 0, maxLat: 0, minLng: 0, maxLng: 0 };
+
+  if (waypoints.length === 0) {
+    return {
+      coveragePercent: 0,
+      totalSamples: 0,
+      coveredSamples: 0,
+      uncoveredSamples: 0,
+      footprintCount: 0,
+      targetArea: emptyTarget,
+      footprints: [],
+      gaps: [],
+    };
+  }
+
+  // ── Target bounding box from all waypoints ────────────────────────────────
+  let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+  for (const w of waypoints) {
+    minLat = Math.min(minLat, w.lat);
+    maxLat = Math.max(maxLat, w.lat);
+    minLng = Math.min(minLng, w.lng);
+    maxLng = Math.max(maxLng, w.lng);
+  }
+  const spanLat = maxLat - minLat || 0.01;
+  const spanLng = maxLng - minLng || 0.01;
+  const marginLat = Math.max(spanLat * 0.1, 0.003);
+  const marginLng = Math.max(spanLng * 0.1, 0.003);
+  minLat -= marginLat;
+  maxLat += marginLat;
+  minLng -= marginLng;
+  maxLng += marginLng;
+
+  // ── Ground footprints for shooting waypoints ───────────────────────────────
+  const halfFovRad = ((config.cameraFov || 75) * Math.PI) / 180 / 2;
+  const footprints: CoverageFootprint[] = [];
+  waypoints.forEach((w, i) => {
+    if (!SHOOTING_ACTIONS.has(w.action)) return;
+    footprints.push({
+      waypointId: w.id,
+      waypointIndex: i,
+      lat: w.lat,
+      lng: w.lng,
+      altitude: w.altitude,
+      radius: Math.max(1, w.altitude * Math.tan(halfFovRad)),
+      action: w.action,
+    });
+  });
+
+  // ── Grid-sample target area and test coverage ─────────────────────────────
+  const rows = resolution;
+  const cols = resolution;
+  const dLat = (maxLat - minLat) / rows;
+  const dLng = (maxLng - minLng) / cols;
+  const refLatRad = (minLat * Math.PI) / 180;
+  const cellArea = dLat * 110540 * dLng * 111320 * Math.cos(refLatRad);
+
+  const uncovered: boolean[][] = Array.from({ length: rows }, () => new Array(cols).fill(false));
+  let total = 0;
+  let covered = 0;
+
+  for (let i = 0; i < rows; i++) {
+    const lat = minLat + (i + 0.5) * dLat;
+    for (let j = 0; j < cols; j++) {
+      const lng = minLng + (j + 0.5) * dLng;
+      total++;
+      let isCovered = false;
+      for (const f of footprints) {
+        if (haversine(lat, lng, f.lat, f.lng) <= f.radius) {
+          isCovered = true;
+          break;
+        }
+      }
+      if (isCovered) covered++;
+      else uncovered[i][j] = true;
+    }
+  }
+
+  // ── Cluster uncovered samples into gaps (4-connected flood fill) ───────────
+  const visited: boolean[][] = Array.from({ length: rows }, () => new Array(cols).fill(false));
+  const gaps: CoverageGap[] = [];
+  let gapIdx = 0;
+
+  for (let i = 0; i < rows; i++) {
+    for (let j = 0; j < cols; j++) {
+      if (!uncovered[i][j] || visited[i][j]) continue;
+
+      const queue: Array<[number, number]> = [[i, j]];
+      visited[i][j] = true;
+      let count = 0;
+      let sumLat = 0;
+      let sumLng = 0;
+
+      while (queue.length) {
+        const [ci, cj] = queue.shift()!;
+        count++;
+        sumLat += minLat + (ci + 0.5) * dLat;
+        sumLng += minLng + (cj + 0.5) * dLng;
+        const neighbors: Array<[number, number]> = [
+          [ci - 1, cj], [ci + 1, cj], [ci, cj - 1], [ci, cj + 1],
+        ];
+        for (const [ni, nj] of neighbors) {
+          if (ni < 0 || ni >= rows || nj < 0 || nj >= cols) continue;
+          if (visited[ni][nj] || !uncovered[ni][nj]) continue;
+          visited[ni][nj] = true;
+          queue.push([ni, nj]);
+        }
+      }
+
+      const centroidLat = sumLat / count;
+      const centroidLng = sumLng / count;
+      const approxArea = count * cellArea;
+      const nearest = findNearestSegment(waypoints, centroidLat, centroidLng);
+      const seg = nearest.segment;
+      const segLabel =
+        seg.fromIndex === seg.toIndex
+          ? `WP${seg.fromIndex + 1}`
+          : `WP${seg.fromIndex + 1}→WP${seg.toIndex + 1}`;
+
+      gaps.push({
+        id: `gap-${gapIdx++}`,
+        centroidLat,
+        centroidLng,
+        sampleCount: count,
+        approxArea,
+        distanceToRoute: nearest.distance,
+        reflight: seg,
+        message:
+          `${segLabel} 附近存在约 ${formatAreaReadable(approxArea)} 漏拍，` +
+          `距航线 ${nearest.distance.toFixed(0)} m，建议补飞该区段`,
+      });
+    }
+  }
+
+  gaps.sort((a, b) => b.approxArea - a.approxArea);
+
+  const coveragePercent = total > 0 ? (covered / total) * 100 : 0;
+
+  return {
+    coveragePercent,
+    totalSamples: total,
+    coveredSamples: covered,
+    uncoveredSamples: total - covered,
+    footprintCount: footprints.length,
+    targetArea: { minLat, maxLat, minLng, maxLng },
+    footprints,
+    gaps,
+  };
+}

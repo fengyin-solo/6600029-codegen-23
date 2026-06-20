@@ -3,6 +3,7 @@ import { onMounted } from 'vue';
 import MapView from './components/MapView.vue';
 import TerrainProfile from './components/TerrainProfile.vue';
 import FlightStats from './components/FlightStats.vue';
+import CoverageCheck from './components/CoverageCheck.vue';
 import { useDroneStore } from './store/drone';
 
 const store = useDroneStore();
@@ -119,6 +120,9 @@ function handlePlanRoute() {
 
         <!-- Flight stats -->
         <FlightStats />
+
+        <!-- Coverage check -->
+        <CoverageCheck />
       </div>
     </div>
   </div>

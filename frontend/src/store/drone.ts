@@ -1,12 +1,13 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import type { Waypoint, NoFlyZone, TerrainPoint, FlightPlan, DroneConfig } from '../types';
+import type { Waypoint, NoFlyZone, TerrainPoint, FlightPlan, DroneConfig, CoverageResult } from '../types';
 import {
   aStarPathfind,
   rrtPathfind,
   smoothPath,
   calculateFlightStats,
   checkTerrainCollision,
+  checkCoverage,
   exportKML,
   mockNoFlyZones,
   mockTerrainData,
@@ -28,7 +29,10 @@ export const useDroneStore = defineStore('drone', () => {
     batteryCapacity: 5000,
     consumptionRate: 100,
     safeDistance: 30,
+    cameraFov: 75,
   });
+
+  const coverageResult = ref<CoverageResult | null>(null);
 
   // ─── Actions ──────────────────────────────────────────────────────────────
   function addWaypoint(
@@ -68,6 +72,7 @@ export const useDroneStore = defineStore('drone', () => {
     waypoints.value = [];
     currentPlan.value = null;
     simProgress.value = 0;
+    coverageResult.value = null;
   }
 
   function updatePlan() {
@@ -80,6 +85,14 @@ export const useDroneStore = defineStore('drone', () => {
       estimatedTime: stats.estimatedTime,
       batteryUsage: stats.batteryUsage,
     };
+  }
+
+  function runCoverageCheck() {
+    if (waypoints.value.length === 0) {
+      coverageResult.value = null;
+      return;
+    }
+    coverageResult.value = checkCoverage(waypoints.value, droneConfig.value);
   }
 
   let simInterval: ReturnType<typeof setInterval> | null = null;
@@ -146,6 +159,9 @@ export const useDroneStore = defineStore('drone', () => {
     });
   });
 
+  const coverageGaps = computed(() => coverageResult.value?.gaps ?? []);
+  const coveragePercent = computed(() => coverageResult.value?.coveragePercent ?? 0);
+
   return {
     waypoints,
     noFlyZones,
@@ -160,6 +176,9 @@ export const useDroneStore = defineStore('drone', () => {
     estimatedTime,
     batteryPercent,
     terrainProfile,
+    coverageResult,
+    coverageGaps,
+    coveragePercent,
     addWaypoint,
     removeWaypoint,
     updateWaypoint,
@@ -169,5 +188,6 @@ export const useDroneStore = defineStore('drone', () => {
     loadMockData,
     exportPlan,
     updatePlan,
+    runCoverageCheck,
   };
 });

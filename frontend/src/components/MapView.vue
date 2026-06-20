@@ -10,6 +10,7 @@ let map: L.Map | null = null;
 let waypointLayer: L.LayerGroup | null = null;
 let routeLayer: L.Polyline | null = null;
 let zoneLayer: L.LayerGroup | null = null;
+let coverageLayer: L.LayerGroup | null = null;
 let droneMarker: L.CircleMarker | null = null;
 
 const addMode = ref(false);
@@ -24,6 +25,7 @@ function initMap() {
 
   waypointLayer = L.layerGroup().addTo(map);
   zoneLayer = L.layerGroup().addTo(map);
+  coverageLayer = L.layerGroup().addTo(map);
 
   map.on('click', (e: L.LeafletMouseEvent) => {
     if (addMode.value) {
@@ -108,6 +110,86 @@ function drawRoute() {
   }).addTo(map);
 }
 
+function drawCoverage() {
+  if (!coverageLayer) return;
+  coverageLayer.clearLayers();
+  const result = store.coverageResult;
+  if (!result || !map) return;
+
+  // Target area bounding box
+  const ta = result.targetArea;
+  L.rectangle(
+    [
+      [ta.minLat, ta.minLng],
+      [ta.maxLat, ta.maxLng],
+    ],
+    {
+      color: '#64748b',
+      weight: 1,
+      dashArray: '4,4',
+      fillOpacity: 0.03,
+    }
+  )
+    .bindTooltip('目标覆盖区域', { sticky: true })
+    .addTo(coverageLayer);
+
+  // Shooting footprints
+  for (const f of result.footprints) {
+    L.circle([f.lat, f.lng], {
+      radius: f.radius,
+      color: '#22c55e',
+      fillColor: '#22c55e',
+      fillOpacity: 0.12,
+      weight: 1,
+    })
+      .bindPopup(
+        `<b>拍摄足迹 WP${f.waypointIndex + 1}</b><br>` +
+        `动作: ${f.action}<br>高度: ${f.altitude}m<br>足迹半径: ${f.radius.toFixed(0)}m`
+      )
+      .addTo(coverageLayer);
+  }
+
+  // Gaps / reflight segments
+  result.gaps.forEach((gap, idx) => {
+    L.circleMarker([gap.centroidLat, gap.centroidLng], {
+      radius: 9,
+      color: '#ef4444',
+      fillColor: '#ef4444',
+      fillOpacity: 0.8,
+      weight: 2,
+    })
+      .bindTooltip(`漏拍 #${idx + 1}`, { permanent: false, direction: 'top' })
+      .bindPopup(
+        `<div style="min-width:180px">` +
+        `<b>漏拍区段 #${idx + 1}</b><br>` +
+        `${gap.message}<br>` +
+        `面积: ~${(gap.approxArea / 1000).toFixed(1)} 千 m²<br>` +
+        `距航线: ${gap.distanceToRoute.toFixed(0)} m` +
+        `</div>`
+      )
+      .addTo(coverageLayer);
+
+    // Highlight the recommended reflight segment
+    const seg = gap.reflight;
+    if (seg.fromIndex !== seg.toIndex) {
+      L.polyline(
+        [
+          [seg.from[0], seg.from[1]],
+          [seg.to[0], seg.to[1]],
+        ],
+        {
+          color: '#f97316',
+          weight: 5,
+          opacity: 0.7,
+          dashArray: '10,6',
+        }
+      )
+        .bindTooltip(`建议补飞: WP${seg.fromIndex + 1}→WP${seg.toIndex + 1}`)
+        .addTo(coverageLayer);
+    }
+  });
+}
+
 function drawSimDrone() {
   if (!map || store.waypoints.length < 2) return;
   const progress = store.simProgress / 100;
@@ -135,10 +217,12 @@ function drawSimDrone() {
 watch(() => store.waypoints.length, () => {
   drawWaypoints();
   drawRoute();
+  drawCoverage();
 });
 
 watch(() => store.noFlyZones.length, drawNoFlyZones);
 watch(() => store.simProgress, drawSimDrone);
+watch(() => store.coverageResult, drawCoverage, { deep: true });
 
 onMounted(() => {
   nextTick(initMap);

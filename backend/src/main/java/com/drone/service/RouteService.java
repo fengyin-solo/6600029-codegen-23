@@ -1,5 +1,7 @@
 package com.drone.service;
 
+import com.drone.model.CoverageGap;
+import com.drone.model.CoverageResult;
 import com.drone.model.Waypoint;
 import org.springframework.stereotype.Service;
 
@@ -181,5 +183,185 @@ public class RouteService {
         }
         sb.append("  </Document>\n</kml>");
         return sb.toString();
+    }
+
+    // ─── Shooting Coverage Check ───────────────────────────────────────────
+    public CoverageResult checkCoverage(List<Waypoint> waypoints, double cameraFov, int resolution) {
+        if (waypoints == null || waypoints.isEmpty()) {
+            return new CoverageResult(0, 0, 0, 0, 0, 0, 0, 0, 0, new ArrayList<>());
+        }
+        if (resolution < 4) resolution = 4;
+
+        // Target bounding box from all waypoints
+        double minLat = Double.POSITIVE_INFINITY, maxLat = Double.NEGATIVE_INFINITY;
+        double minLng = Double.POSITIVE_INFINITY, maxLng = Double.NEGATIVE_INFINITY;
+        for (Waypoint w : waypoints) {
+            minLat = Math.min(minLat, w.getLat());
+            maxLat = Math.max(maxLat, w.getLat());
+            minLng = Math.min(minLng, w.getLng());
+            maxLng = Math.max(maxLng, w.getLng());
+        }
+        double spanLat = (maxLat - minLat) == 0 ? 0.01 : (maxLat - minLat);
+        double spanLng = (maxLng - minLng) == 0 ? 0.01 : (maxLng - minLng);
+        double marginLat = Math.max(spanLat * 0.1, 0.003);
+        double marginLng = Math.max(spanLng * 0.1, 0.003);
+        minLat -= marginLat;
+        maxLat += marginLat;
+        minLng -= marginLng;
+        maxLng += marginLng;
+
+        // Ground footprints for shooting waypoints (photo / video only)
+        double fov = cameraFov > 0 ? cameraFov : 75;
+        double tanHalf = Math.tan(Math.toRadians(fov) / 2.0);
+        List<double[]> footprints = new ArrayList<>();
+        for (int i = 0; i < waypoints.size(); i++) {
+            Waypoint w = waypoints.get(i);
+            String action = w.getAction();
+            if (!"photo".equals(action) && !"video".equals(action)) continue;
+            double radius = Math.max(1, w.getAltitude() * tanHalf);
+            footprints.add(new double[]{w.getLat(), w.getLng(), radius, i});
+        }
+
+        // Grid-sample target area and test coverage
+        int rows = resolution, cols = resolution;
+        double dLat = (maxLat - minLat) / rows;
+        double dLng = (maxLng - minLng) / cols;
+        double cellArea = dLat * 110540.0 * dLng * 111320.0 * Math.cos(Math.toRadians(minLat));
+
+        boolean[][] uncovered = new boolean[rows][cols];
+        int total = 0, covered = 0;
+        for (int i = 0; i < rows; i++) {
+            double lat = minLat + (i + 0.5) * dLat;
+            for (int j = 0; j < cols; j++) {
+                double lng = minLng + (j + 0.5) * dLng;
+                total++;
+                boolean isCovered = false;
+                for (double[] f : footprints) {
+                    if (haversine(lat, lng, f[0], f[1]) <= f[2]) {
+                        isCovered = true;
+                        break;
+                    }
+                }
+                if (isCovered) covered++;
+                else uncovered[i][j] = true;
+            }
+        }
+
+        // Cluster uncovered samples into gaps (4-connected flood fill)
+        boolean[][] visited = new boolean[rows][cols];
+        List<CoverageGap> gaps = new ArrayList<>();
+        int gapIdx = 0;
+        int[][] dirs = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+        for (int i = 0; i < rows; i++) {
+            for (int j = 0; j < cols; j++) {
+                if (!uncovered[i][j] || visited[i][j]) continue;
+                Deque<int[]> queue = new ArrayDeque<>();
+                queue.push(new int[]{i, j});
+                visited[i][j] = true;
+                int count = 0;
+                double sumLat = 0, sumLng = 0;
+                while (!queue.isEmpty()) {
+                    int[] cur = queue.pop();
+                    int ci = cur[0], cj = cur[1];
+                    count++;
+                    sumLat += minLat + (ci + 0.5) * dLat;
+                    sumLng += minLng + (cj + 0.5) * dLng;
+                    for (int[] d : dirs) {
+                        int ni = ci + d[0], nj = cj + d[1];
+                        if (ni < 0 || ni >= rows || nj < 0 || nj >= cols) continue;
+                        if (visited[ni][nj] || !uncovered[ni][nj]) continue;
+                        visited[ni][nj] = true;
+                        queue.push(new int[]{ni, nj});
+                    }
+                }
+                double centroidLat = sumLat / count;
+                double centroidLng = sumLng / count;
+                double approxArea = count * cellArea;
+                double[] nearest = findNearestSegment(waypoints, centroidLat, centroidLng);
+                int fromIndex = (int) nearest[0];
+                int toIndex = (int) nearest[1];
+                double distanceToRoute = nearest[2];
+                double segmentDistance = nearest[3];
+                Waypoint a = waypoints.get(fromIndex);
+                Waypoint b = waypoints.get(toIndex);
+                String segLabel = fromIndex == toIndex
+                        ? "WP" + (fromIndex + 1)
+                        : "WP" + (fromIndex + 1) + "→WP" + (toIndex + 1);
+                String message = String.format(
+                        "%s 附近存在约 %s 漏拍，距航线 %.0f m，建议补飞该区段",
+                        segLabel, formatAreaReadable(approxArea), distanceToRoute
+                );
+                gaps.add(new CoverageGap(
+                        "gap-" + (gapIdx++),
+                        centroidLat, centroidLng, count, approxArea, distanceToRoute,
+                        fromIndex, toIndex, a.getId(), b.getId(),
+                        a.getLat(), a.getLng(), b.getLat(), b.getLng(),
+                        segmentDistance, message
+                ));
+            }
+        }
+
+        gaps.sort((g1, g2) -> Double.compare(g2.getApproxArea(), g1.getApproxArea()));
+        double coveragePercent = total > 0 ? (covered * 100.0 / total) : 0;
+        return new CoverageResult(
+                coveragePercent, total, covered, total - covered, footprints.size(),
+                minLat, maxLat, minLng, maxLng, gaps
+        );
+    }
+
+    private double[] toPlanar(double lat, double lng, double refLat) {
+        double refLatRad = Math.toRadians(refLat);
+        double x = lng * 111320.0 * Math.cos(refLatRad);
+        double y = lat * 110540.0;
+        return new double[]{x, y};
+    }
+
+    private double pointToSegmentDistance(double pLat, double pLng,
+                                          double aLat, double aLng,
+                                          double bLat, double bLng) {
+        double[] p = toPlanar(pLat, pLng, pLat);
+        double[] a = toPlanar(aLat, aLng, pLat);
+        double[] b = toPlanar(bLat, bLng, pLat);
+        double dx = b[0] - a[0];
+        double dy = b[1] - a[1];
+        double segLenSq = dx * dx + dy * dy;
+        double t = 0;
+        if (segLenSq > 0) {
+            t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / segLenSq;
+            t = Math.max(0, Math.min(1, t));
+        }
+        double cx = a[0] + t * dx;
+        double cy = a[1] + t * dy;
+        return Math.sqrt((p[0] - cx) * (p[0] - cx) + (p[1] - cy) * (p[1] - cy));
+    }
+
+    // Returns {fromIndex, toIndex, distanceToSegment, segmentDistance}
+    private double[] findNearestSegment(List<Waypoint> waypoints, double lat, double lng) {
+        int n = waypoints.size();
+        if (n == 1) {
+            Waypoint w = waypoints.get(0);
+            return new double[]{0, 0, haversine(lat, lng, w.getLat(), w.getLng()), 0};
+        }
+        double best = Double.POSITIVE_INFINITY;
+        int bestFrom = 0, bestTo = 0;
+        double bestSegDist = 0;
+        for (int i = 0; i < n - 1; i++) {
+            Waypoint a = waypoints.get(i);
+            Waypoint b = waypoints.get(i + 1);
+            double dist = pointToSegmentDistance(lat, lng, a.getLat(), a.getLng(), b.getLat(), b.getLng());
+            if (dist < best) {
+                best = dist;
+                bestFrom = i;
+                bestTo = i + 1;
+                bestSegDist = haversine(a.getLat(), a.getLng(), b.getLat(), b.getLng());
+            }
+        }
+        return new double[]{bestFrom, bestTo, best, bestSegDist};
+    }
+
+    private String formatAreaReadable(double m2) {
+        if (m2 >= 1000000) return String.format("%.2f km²", m2 / 1000000.0);
+        if (m2 >= 1000) return String.format("%.1f 千 m²", m2 / 1000.0);
+        return String.format("%.0f m²", m2);
     }
 }

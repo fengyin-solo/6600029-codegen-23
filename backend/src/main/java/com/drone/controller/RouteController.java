@@ -1,5 +1,6 @@
 package com.drone.controller;
 
+import com.drone.model.CoverageResult;
 import com.drone.model.Waypoint;
 import com.drone.service.RouteService;
 import org.springframework.web.bind.annotation.*;
@@ -59,5 +60,31 @@ public class RouteController {
 
         String kml = routeService.exportKML(waypoints, name);
         return Map.of("kml", kml);
+    }
+
+    @PostMapping("/coverage/check")
+    public CoverageResult checkCoverage(@RequestBody Map<String, Object> request) {
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> wpData = (List<Map<String, Object>>) request.get("waypoints");
+        double cameraFov = request.get("cameraFov") != null
+                ? ((Number) request.get("cameraFov")).doubleValue() : 75;
+        int resolution = request.get("resolution") != null
+                ? ((Number) request.get("resolution")).intValue() : 32;
+
+        List<Waypoint> waypoints = new java.util.ArrayList<>();
+        if (wpData != null) {
+            for (Map<String, Object> w : wpData) {
+                waypoints.add(new Waypoint(
+                        (String) w.get("id"),
+                        ((Number) w.get("lat")).doubleValue(),
+                        ((Number) w.get("lng")).doubleValue(),
+                        ((Number) w.get("altitude")).doubleValue(),
+                        ((Number) w.get("speed")).doubleValue(),
+                        (String) w.get("action")
+                ));
+            }
+        }
+
+        return routeService.checkCoverage(waypoints, cameraFov, resolution);
     }
 }
